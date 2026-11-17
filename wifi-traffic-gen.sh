@@ -35,6 +35,7 @@ INTER_DL_MIN=1         # min gap between downloads (seconds)
 INTER_DL_MAX=5         # max gap between downloads (seconds)
 CYCLES=0               # 0 = keep going until the MAC pool is exhausted
 NET_ORDER="seq"        # seq | random  (which SSID each cycle picks)
+HOSTNAME_PREFIX="wtg"  # DHCP hostname prefix for test clients (option 12)
 DRY_RUN=0              # 1 = parse + plan only, touch no hardware
 VERBOSE=0
 
@@ -68,6 +69,9 @@ Usage: sudo $0 [options]
   --downloads N     successful downloads/cycle    (default: $MIN_DOWNLOADS)
   --cycles N        number of cycles, 0=exhaust pool (default: $CYCLES)
   --order seq|random  SSID pick order             (default: $NET_ORDER)
+  --hostname-prefix P  DHCP hostname prefix        (default: $HOSTNAME_PREFIX)
+                       each client sends "P-<mac suffix>" as DHCP option 12;
+                       the host's own /etc/hostname is NEVER changed.
   --dl-timeout N    per-download ceiling seconds  (default: $DL_MAX_TIME)
   --dry-run         parse and plan only; no radio changes
   -v, --verbose
@@ -94,6 +98,7 @@ while [[ $# -gt 0 ]]; do
         --downloads) MIN_DOWNLOADS="$2"; shift 2;;
         --cycles) CYCLES="$2"; shift 2;;
         --order) NET_ORDER="$2"; shift 2;;
+        --hostname-prefix) HOSTNAME_PREFIX="$2"; shift 2;;
         --dl-timeout) DL_MAX_TIME="$2"; shift 2;;
         --dry-run) DRY_RUN=1; shift;;
         -v|--verbose) VERBOSE=1; shift;;
@@ -119,18 +124,32 @@ gen_random_mac() {
 
 normalise_mac() { tr 'A-F' 'a-f' <<<"${1// /}"; }
 
+# Build a DHCP hostname from the prefix + last 3 octets of the MAC.
+# Sanitised to RFC-952/1123 label rules (lowercase a-z 0-9 '-', <=63 chars).
+gen_hostname() {
+    local mac="$1" nocolon suffix p
+    nocolon="${mac//:/}"
+    suffix="${nocolon: -6}"                 # last 6 hex chars (3 octets)
+    p="${HOSTNAME_PREFIX,,}"                 # lowercase
+    p="${p//[^a-z0-9-]/-}"                   # invalid chars -> hyphen
+    p="${p#-}"; p="${p%-}"                   # trim leading/trailing hyphens
+    [[ -z "$p" ]] && p="wtg"
+    (( ${#p} > 50 )) && p="${p:0:50}"        # keep total <= 63
+    echo "${p}-${suffix}"
+}
+
 mac_already_used() {   # returns 0 if MAC present in USED_LOG
     local mac; mac="$(normalise_mac "$1")"
     [[ -f "$USED_LOG" ]] || return 1
     cut -d, -f2 "$USED_LOG" 2>/dev/null | grep -qiFx "$mac"
 }
 
-record_mac() {         # record_mac MAC SSID RESULT
-    local mac ssid result ts
-    mac="$(normalise_mac "$1")"; ssid="$2"; result="$3"
+record_mac() {         # record_mac MAC SSID HOSTNAME RESULT
+    local mac ssid hostname result ts
+    mac="$(normalise_mac "$1")"; ssid="$2"; hostname="$3"; result="$4"
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    [[ -f "$USED_LOG" ]] || echo "timestamp,mac,ssid,result" >"$USED_LOG"
-    printf '%s,%s,%s,%s\n' "$ts" "$mac" "$ssid" "$result" >>"$USED_LOG"
+    [[ -f "$USED_LOG" ]] || echo "timestamp,mac,ssid,hostname,result" >"$USED_LOG"
+    printf '%s,%s,%s,%s,%s\n' "$ts" "$mac" "$ssid" "$hostname" "$result" >>"$USED_LOG"
 }
 
 require_tools() {
@@ -236,10 +255,20 @@ associate() {
 }
 
 dhcp_up() {
+    local hn="$1" cf
     case "$DHCP_CMD" in
-        dhclient) timeout "$DHCP_TIMEOUT" dhclient -1 "$IFACE" >/dev/null 2>&1;;
-        dhcpcd)   timeout "$DHCP_TIMEOUT" dhcpcd -4 -t "$DHCP_TIMEOUT" "$IFACE" >/dev/null 2>&1;;
-        udhcpc)   timeout "$DHCP_TIMEOUT" udhcpc -i "$IFACE" -n -q >/dev/null 2>&1;;
+        dhclient)
+            # per-cycle conf injects DHCP option 12; system hostname untouched
+            cf="$STATE_DIR/dhclient.$$.conf"
+            printf 'send host-name "%s";\n' "$hn" >"$cf"
+            timeout "$DHCP_TIMEOUT" dhclient -1 -cf "$cf" "$IFACE" >/dev/null 2>&1
+            ;;
+        dhcpcd)
+            timeout "$DHCP_TIMEOUT" dhcpcd -4 -t "$DHCP_TIMEOUT" -h "$hn" "$IFACE" >/dev/null 2>&1
+            ;;
+        udhcpc)
+            timeout "$DHCP_TIMEOUT" udhcpc -i "$IFACE" -x "hostname:$hn" -n -q >/dev/null 2>&1
+            ;;
     esac
     ip -4 addr show dev "$IFACE" | grep -q 'inet '
 }
@@ -286,13 +315,14 @@ do_downloads() {
 # ---------------- one cycle ----------------
 run_cycle() {
     local mac="$1" ssid="$2" psk="$3"
-    local budget dls result="fail"
+    local budget dls result="fail" hn
     budget="$(rand_between "$MIN_SECS" "$MAX_SECS")"
-    info "Cycle: mac=$mac ssid=\"$ssid\" budget=${budget}s downloads=$MIN_DOWNLOADS"
+    hn="$(gen_hostname "$mac")"
+    info "Cycle: mac=$mac host=$hn ssid=\"$ssid\" budget=${budget}s downloads=$MIN_DOWNLOADS"
 
     if (( DRY_RUN )); then
-        info "  [dry-run] would set MAC, associate, DHCP, download, disconnect"
-        record_mac "$mac" "$ssid" "dry-run"
+        info "  [dry-run] would set MAC, associate, DHCP (hostname=$hn), download, disconnect"
+        record_mac "$mac" "$ssid" "$hn" "dry-run"
         return 0
     fi
 
@@ -300,11 +330,11 @@ run_cycle() {
     local start now elapsed
     start="$(date +%s)"
 
-    if ! set_mac "$mac";            then warn "  MAC set failed";    record_mac "$mac" "$ssid" "mac-fail";   return 1; fi
-    if ! associate "$ssid" "$psk";  then warn "  association failed"; teardown_link; record_mac "$mac" "$ssid" "assoc-fail"; return 1; fi
+    if ! set_mac "$mac";            then warn "  MAC set failed";    record_mac "$mac" "$ssid" "$hn" "mac-fail";   return 1; fi
+    if ! associate "$ssid" "$psk";  then warn "  association failed"; teardown_link; record_mac "$mac" "$ssid" "$hn" "assoc-fail"; return 1; fi
     info "  associated"
-    if ! dhcp_up;                   then warn "  DHCP failed";       dhcp_down; teardown_link; record_mac "$mac" "$ssid" "dhcp-fail"; return 1; fi
-    info "  lease acquired: $(ip -4 -o addr show dev "$IFACE" | awk '{print $4}' | head -1)"
+    if ! dhcp_up "$hn";             then warn "  DHCP failed";       dhcp_down; teardown_link; record_mac "$mac" "$ssid" "$hn" "dhcp-fail"; return 1; fi
+    info "  lease acquired: $(ip -4 -o addr show dev "$IFACE" | awk '{print $4}' | head -1) as $hn"
 
     do_downloads "$MIN_DOWNLOADS" && result="ok" || result="partial-dl"
 
@@ -318,7 +348,7 @@ run_cycle() {
     info "  disconnecting after $(( $(date +%s) - start ))s"
     dhcp_down; teardown_link
     CUR_MAC=""; CUR_SSID=""
-    record_mac "$mac" "$ssid" "$result"
+    record_mac "$mac" "$ssid" "$hn" "$result"
     return 0
 }
 

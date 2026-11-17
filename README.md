@@ -49,7 +49,17 @@ Key flags (`--help` for the full list):
 | `--downloads N` | successful downloads per cycle | `3` |
 | `--cycles N` | number of cycles; `0` = exhaust MAC pool | `0` |
 | `--order seq\|random` | SSID pick order | `seq` |
+| `--hostname-prefix P` | DHCP hostname prefix for test clients | `wtg` |
 | `--dry-run` | parse + plan only | off |
+
+### Hostnames
+
+Each client sends a hostname as **DHCP option 12** so test clients are easy to
+spot in the NMS. The hostname is `<prefix>-<last 3 octets of MAC>`, e.g.
+`wtg-334401`. Set the prefix with `--hostname-prefix` (it's sanitised to valid
+hostname characters). The host's own `/etc/hostname` is **never** changed — the
+name is injected into each DHCP request only, so the impact on the machine is
+nil. The chosen hostname is recorded per cycle in `used_macs.csv`.
 
 ## Input files
 
