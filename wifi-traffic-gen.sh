@@ -33,24 +33,46 @@ DHCP_TIMEOUT=20        # seconds to obtain a lease
 DL_MAX_TIME=30         # per-download curl ceiling (seconds)
 INTER_DL_MIN=1         # min gap between downloads (seconds)
 INTER_DL_MAX=5         # max gap between downloads (seconds)
-CYCLES=0               # 0 = keep going until the MAC pool is exhausted
+CYCLES=0               # legacy cap on total cycles (0 = no cap); see run modes
 NET_ORDER="seq"        # seq | random  (which SSID each cycle picks)
 HOSTNAME_PREFIX="wtg"  # DHCP hostname prefix for test clients (option 12)
 DRY_RUN=0              # 1 = parse + plan only, touch no hardware
 VERBOSE=0
+
+LOG_FILE="./wifi-traffic-gen.log"  # syslog-format event log; "" or --no-log disables
+# Run length (pick one; default = run each unused pool MAC once):
+RUN_MODE="pool"        # pool | repeats | duration | continuous
+REPEATS=0              # repeats mode: number of cycles to run
+DURATION=0             # duration mode: seconds of wall-clock to keep running
+AUTO_MAC=-1            # -1 = decide by mode; 0/1 = explicit. Generate fresh
+                       # random MACs once the file pool is spent (loop modes).
 
 WPA_CONF=""            # temp per-cycle wpa_supplicant conf
 WPA_PID=""
 CUR_MAC=""
 CUR_SSID=""
 DHCP_CMD=""            # resolved by require_tools; kept defined for set -u
+SYSLOG_TAG="wifi-traffic-gen"
+HOSTN="${HOSTNAME:-$(hostname 2>/dev/null || echo localhost)}"
 
 # ---------------- logging ----------------
-log()  { printf '%(%Y-%m-%dT%H:%M:%S)T [%s] %s\n' -1 "${1}" "${2}"; }
-info() { log INFO "$*"; }
-warn() { log WARN "$*" >&2; }
-err()  { log ERR  "$*" >&2; }
-dbg()  { [[ "$VERBOSE" -eq 1 ]] && log DBG "$*" || true; }
+# Console line: ISO-ish + [LEVEL]. File line: RFC3164 syslog-style, severities
+# INFO (normal), WARNING (problems), ERR (fatal), DEBUG (verbose).
+_log_file() {   # _log_file LEVEL MESSAGE
+    [[ -n "$LOG_FILE" ]] || return 0
+    printf '%s %s %s[%d]: %s: %s\n' \
+        "$(date '+%b %e %H:%M:%S')" "$HOSTN" "$SYSLOG_TAG" "$$" "$1" "$2" \
+        >>"$LOG_FILE" 2>/dev/null || true
+}
+log() {   # log LEVEL MESSAGE [STREAM]
+    local level="$1" msg="$2" stream="${3:-1}"
+    printf '%(%Y-%m-%dT%H:%M:%S)T [%s] %s\n' -1 "$level" "$msg" >&"$stream"
+    _log_file "$level" "$msg"
+}
+info() { log INFO    "$*" 1; }
+warn() { log WARNING "$*" 2; }
+err()  { log ERR     "$*" 2; }
+dbg()  { [[ "$VERBOSE" -eq 1 ]] && log DEBUG "$*" 1 || true; }
 die()  { err "$*"; cleanup; exit 1; }
 
 usage() {
@@ -64,18 +86,37 @@ Usage: sudo $0 [options]
   -m FILE           MAC address pool file         (default: $MACS_FILE)
   -u FILE           download URL list             (default: $URLS_FILE)
   -l FILE           used-MAC record (append)      (default: $USED_LOG)
-  --min-secs N      min connected seconds         (default: $MIN_SECS)
-  --max-secs N      max connected seconds         (default: $MAX_SECS)
+  -L FILE / --log FILE  syslog-format event log   (default: $LOG_FILE)
+  --no-log          disable the event log file
+  --session-min N   min connected seconds         (default: $MIN_SECS)
+  --session-max N   max connected seconds         (default: $MAX_SECS)
+  --min-secs N      alias of --session-min
+  --max-secs N      alias of --session-max
   --downloads N     successful downloads/cycle    (default: $MIN_DOWNLOADS)
-  --cycles N        number of cycles, 0=exhaust pool (default: $CYCLES)
   --order seq|random  SSID pick order             (default: $NET_ORDER)
   --hostname-prefix P  DHCP hostname prefix        (default: $HOSTNAME_PREFIX)
                        each client sends "P-<mac suffix>" as DHCP option 12;
                        the host's own /etc/hostname is NEVER changed.
   --dl-timeout N    per-download ceiling seconds  (default: $DL_MAX_TIME)
+
+  Run length (choose one; default runs each unused pool MAC once):
+  --repeats N       run exactly N cycles then stop
+  --duration T      run cycles until T elapses (e.g. 90s, 30m, 2h, or plain secs)
+  --continuous      run until interrupted (Ctrl-C)
+  --cycles N        hard cap on total cycles in any mode (0 = no cap)
+  --no-auto-mac     in loop modes, stop when the file MAC pool is spent
+                    instead of generating fresh random MACs
+
   --dry-run         parse and plan only; no radio changes
   -v, --verbose
   -h, --help
+
+Notes:
+  * Session time is randomised per cycle between --session-min and
+    --session-max, e.g. --session-min 60 --session-max 300.
+  * repeats/duration/continuous keep going past the file MAC pool by
+    generating fresh locally-administered random MACs (never reused),
+    unless --no-auto-mac is given.
 
 File formats:
   networks.conf : one "SSID<TAB>PSK" per line (or 'SSID|PSK'). # comments ok.
@@ -93,10 +134,16 @@ while [[ $# -gt 0 ]]; do
         -m) MACS_FILE="$2"; shift 2;;
         -u) URLS_FILE="$2"; shift 2;;
         -l) USED_LOG="$2"; shift 2;;
-        --min-secs) MIN_SECS="$2"; shift 2;;
-        --max-secs) MAX_SECS="$2"; shift 2;;
+        -L|--log) LOG_FILE="$2"; shift 2;;
+        --no-log) LOG_FILE=""; shift;;
+        --session-min|--min-secs) MIN_SECS="$2"; shift 2;;
+        --session-max|--max-secs) MAX_SECS="$2"; shift 2;;
         --downloads) MIN_DOWNLOADS="$2"; shift 2;;
         --cycles) CYCLES="$2"; shift 2;;
+        --repeats) RUN_MODE="repeats"; REPEATS="$2"; shift 2;;
+        --duration) RUN_MODE="duration"; DURATION="$2"; shift 2;;
+        --continuous) RUN_MODE="continuous"; shift;;
+        --no-auto-mac) AUTO_MAC=0; shift;;
         --order) NET_ORDER="$2"; shift 2;;
         --hostname-prefix) HOSTNAME_PREFIX="$2"; shift 2;;
         --dl-timeout) DL_MAX_TIME="$2"; shift 2;;
@@ -112,6 +159,19 @@ rand_between() {   # rand_between MIN MAX -> inclusive integer
     local lo=$1 hi=$2
     (( hi <= lo )) && { echo "$lo"; return; }
     echo $(( lo + RANDOM % (hi - lo + 1) ))
+}
+
+# parse_duration 90s|30m|2h|1d|N  ->  seconds
+parse_duration() {
+    local s="$1"
+    [[ "$s" =~ ^([0-9]+)([smhd]?)$ ]] || die "Invalid duration: $s (use e.g. 90s, 30m, 2h)"
+    local n="${BASH_REMATCH[1]}" u="${BASH_REMATCH[2]}"
+    case "$u" in
+        ""|s) echo "$n";;
+        m)    echo $(( n * 60 ));;
+        h)    echo $(( n * 3600 ));;
+        d)    echo $(( n * 86400 ));;
+    esac
 }
 
 # A locally-administered, unicast MAC: 2nd-least-significant bit of byte0 set,
@@ -168,6 +228,32 @@ require_tools() {
 
 # ---------------- input loading ----------------
 declare -a SSIDS PSKS URLS MAC_POOL
+declare -A SEEN_MAC    # MACs issued this run (guards against in-run collisions)
+POOL_IDX=0            # cursor into MAC_POOL
+
+# Set NEXT_MAC to the next never-used MAC and return 0, or return non-zero when
+# none remain. MUST be called directly (not in $()), so its updates to POOL_IDX
+# and SEEN_MAC persist in the current shell. Draws from the file pool first,
+# then (loop modes) generates fresh random MACs.
+NEXT_MAC=""
+next_mac() {
+    local m
+    while (( POOL_IDX < ${#MAC_POOL[@]} )); do
+        m="${MAC_POOL[$POOL_IDX]}"; ((POOL_IDX++))
+        [[ -n "${SEEN_MAC[$m]:-}" ]] && continue
+        SEEN_MAC[$m]=1; NEXT_MAC="$m"; return 0
+    done
+    if (( AUTO_MAC == 1 )); then
+        local tries=0
+        while (( tries < 2000 )); do
+            m="$(gen_random_mac)"; ((tries++))
+            [[ -n "${SEEN_MAC[$m]:-}" ]] && continue
+            mac_already_used "$m" && continue
+            SEEN_MAC[$m]=1; NEXT_MAC="$m"; return 0
+        done
+    fi
+    return 1
+}
 
 load_networks() {
     [[ -f "$NETWORKS_FILE" ]] || die "Networks file not found: $NETWORKS_FILE"
@@ -363,7 +449,17 @@ trap 'err "Signal caught"; cleanup; exit 130' INT TERM
 # ---------------- main ----------------
 main() {
     (( DRY_RUN == 0 && EUID != 0 )) && die "Must run as root (needs ip/wpa_supplicant). Try: sudo $0 ..."
-    (( MIN_SECS <= MAX_SECS )) || die "--min-secs must be <= --max-secs"
+    (( MIN_SECS <= MAX_SECS )) || die "--session-min must be <= --session-max"
+    [[ "$NET_ORDER" == seq || "$NET_ORDER" == random ]] || die "--order must be seq or random"
+
+    # Resolve duration string -> seconds, and AUTO_MAC default by mode.
+    if [[ "$RUN_MODE" == "duration" ]]; then
+        DURATION="$(parse_duration "$DURATION")"
+    fi
+    if (( AUTO_MAC == -1 )); then
+        [[ "$RUN_MODE" == "pool" ]] && AUTO_MAC=0 || AUTO_MAC=1
+    fi
+
     mkdir -p "$STATE_DIR"
     (( DRY_RUN == 0 )) && require_tools
 
@@ -371,27 +467,40 @@ main() {
     load_urls
     load_macs
 
-    local pool=("${MAC_POOL[@]}")
-    local total=${#pool[@]}
-    local planned=$total
-    (( CYCLES > 0 && CYCLES < total )) && planned=$CYCLES
-    info "Planned cycles: $planned (interface=$IFACE, order=$NET_ORDER, dry_run=$DRY_RUN)"
+    case "$RUN_MODE" in
+        pool)       info "Run mode: pool (${#MAC_POOL[@]} unused MAC(s), one pass)";;
+        repeats)    info "Run mode: repeats ($REPEATS cycle(s), auto-mac=$AUTO_MAC)";;
+        duration)   info "Run mode: duration (${DURATION}s, auto-mac=$AUTO_MAC)";;
+        continuous) info "Run mode: continuous until interrupted (auto-mac=$AUTO_MAC)";;
+    esac
+    info "Settings: iface=$IFACE order=$NET_ORDER session=${MIN_SECS}-${MAX_SECS}s downloads=$MIN_DOWNLOADS cap=$CYCLES dry_run=$DRY_RUN"
 
-    local i ok=0 n=0 idx mac
-    for (( i=0; i<planned; i++ )); do
-        mac="${pool[$i]}"
+    local i=0 ok=0 n=0 idx mac start
+    start="$(date +%s)"
+    while :; do
+        # ---- termination checks ----
+        case "$RUN_MODE" in
+            repeats)    (( i >= REPEATS )) && break;;
+            duration)   (( $(date +%s) - start >= DURATION )) && break;;
+            continuous) : ;;
+            pool)       : ;;   # ends when next_mac is exhausted
+        esac
+        (( CYCLES > 0 && i >= CYCLES )) && break
+
+        next_mac || { info "MAC supply exhausted after $n cycle(s)."; break; }
+        mac="$NEXT_MAC"
+
         if [[ "$NET_ORDER" == "random" ]]; then
             idx=$(( RANDOM % ${#SSIDS[@]} ))
         else
             idx=$(( i % ${#SSIDS[@]} ))
         fi
         ((n++))
-        if run_cycle "$mac" "${SSIDS[$idx]}" "${PSKS[$idx]}"; then
-            ((ok++))
-        fi
+        run_cycle "$mac" "${SSIDS[$idx]}" "${PSKS[$idx]}" && ((ok++))
+        ((i++))
     done
 
-    info "Done. $ok/$n cycle(s) succeeded. Used-MAC log: $USED_LOG"
+    info "Done. $ok/$n cycle(s) succeeded. Used-MAC log: $USED_LOG${LOG_FILE:+, event log: $LOG_FILE}"
     cleanup
     return 0
 }

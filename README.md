@@ -45,12 +45,44 @@ Key flags (`--help` for the full list):
 | Flag | Meaning | Default |
 |------|---------|---------|
 | `-i IFACE` | wireless interface | `wlan0` |
-| `--min-secs` / `--max-secs` | connected-time window (s) | `30` / `120` |
+| `--session-min` / `--session-max` | random connected-time window (s) | `30` / `120` |
 | `--downloads N` | successful downloads per cycle | `3` |
-| `--cycles N` | number of cycles; `0` = exhaust MAC pool | `0` |
 | `--order seq\|random` | SSID pick order | `seq` |
 | `--hostname-prefix P` | DHCP hostname prefix for test clients | `wtg` |
+| `-L FILE` / `--log FILE` | syslog-format event log | `wifi-traffic-gen.log` |
+| `--no-log` | disable the event log | — |
 | `--dry-run` | parse + plan only | off |
+
+`--min-secs` / `--max-secs` are kept as aliases of `--session-min` /
+`--session-max`.
+
+### Run length
+
+Pick one; the default runs each unused pool MAC once:
+
+| Flag | Meaning |
+|------|---------|
+| `--repeats N` | run exactly N cycles then stop |
+| `--duration T` | run until T elapses — `90s`, `30m`, `2h`, or plain seconds |
+| `--continuous` | run until interrupted (Ctrl-C) |
+| `--cycles N` | hard cap on total cycles in any mode (`0` = no cap) |
+| `--no-auto-mac` | in loop modes, stop when the file pool is spent instead of generating MACs |
+
+Because a MAC is never reused, `--repeats` / `--duration` / `--continuous`
+generate fresh locally-administered random MACs once the file pool is spent (so
+a continuous run keeps producing distinct clients). `--no-auto-mac` disables
+that and stops at the end of the file pool.
+
+### Logging
+
+Two records are written:
+
+- **`used_macs.csv`** — one row per cycle: `timestamp,mac,ssid,hostname,result`.
+  The authoritative record of which MACs have been used (drives no-reuse).
+- **`wifi-traffic-gen.log`** — syslog-format (RFC3164) event log of
+  associations, leases, downloads, errors and disconnects. `INFO` for normal
+  actions, `WARNING`/`ERR` for problems, `DEBUG` with `-v`. Point it elsewhere
+  with `-L`, or turn it off with `--no-log`.
 
 ### Hostnames
 
