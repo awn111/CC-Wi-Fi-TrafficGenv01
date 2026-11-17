@@ -1,0 +1,9 @@
+# macs.txt  -  one MAC per line, AA:BB:CC:DD:EE:FF
+# The literal token  random  expands to a locally-administered random MAC.
+# Already-used MACs (present in used_macs.csv) are skipped automatically.
+02:11:22:33:44:01
+02:11:22:33:44:02
+02:11:22:33:44:03
+random
+random
+random

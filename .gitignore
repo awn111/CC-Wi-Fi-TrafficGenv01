@@ -1,0 +1,12 @@
+# Runtime artifacts — never commit
+used_macs.csv
+.wtg-run/
+*.log
+
+# Local copies of real credentials — keep PSKs out of the repo
+networks.conf
+macs.txt
+urls.txt
+!examples/networks.conf
+!examples/macs.txt
+!examples/urls.txt

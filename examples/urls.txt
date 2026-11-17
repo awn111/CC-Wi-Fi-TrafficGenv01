@@ -1,0 +1,7 @@
+# urls.txt  -  one URL per line. Point these at your own test server for a
+# closed demo, or at public speed-test files. Mix sizes for varied traffic.
+https://speed.hetzner.de/1MB.bin
+https://speed.hetzner.de/10MB.bin
+https://proof.ovh.net/files/1Mb.dat
+https://proof.ovh.net/files/10Mb.dat
+http://ipv4.download.thinkbroadband.com/5MB.zip
