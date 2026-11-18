@@ -1,9 +1,23 @@
-# macs.txt  -  one MAC per line, AA:BB:CC:DD:EE:FF
-# The literal token  random  expands to a locally-administered random MAC.
-# Already-used MACs (present in used_macs.csv) are skipped automatically.
+# macs.txt
+#   A plain MAC (AA:BB:CC:DD:EE:FF) = a STATIC / returning user. It recurs every
+#   pass in loop modes and gets the --static-prefix hostname (default su-...),
+#   so the NMS sees the same client coming and going over time.
+#
+#   The token  random  = a TRANSIENT client slot. A fresh locally-administered
+#   MAC is minted each time it's drawn, with the --hostname-prefix (default
+#   wtg-...). Use several for a stream of one-off clients.
+#
+#   MAC reuse is allowed (no dedup) — returning users are the point.
+
+# --- static / returning users ---
 02:11:22:33:44:01
 02:11:22:33:44:02
 02:11:22:33:44:03
+02:11:22:33:44:04
+02:11:22:33:44:05
+02:11:22:33:44:06
+
+# --- transient client slots ---
 random
 random
 random

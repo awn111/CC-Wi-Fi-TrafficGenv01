@@ -33,19 +33,21 @@ DHCP_TIMEOUT=20        # seconds to obtain a lease
 DL_MAX_TIME=30         # per-download curl ceiling (seconds)
 INTER_DL_MIN=1         # min gap between downloads (seconds)
 INTER_DL_MAX=5         # max gap between downloads (seconds)
-CYCLES=0               # legacy cap on total cycles (0 = no cap); see run modes
+CYCLES=0               # cap on total cycles (0 = no cap); see run modes
 NET_ORDER="seq"        # seq | random  (which SSID each cycle picks)
-HOSTNAME_PREFIX="wtg"  # DHCP hostname prefix for test clients (option 12)
+HOSTNAME_PREFIX="wtg"  # DHCP hostname prefix for TRANSIENT (random) clients
+STATIC_PREFIX="su"     # DHCP hostname prefix for STATIC users (file MACs)
 DRY_RUN=0              # 1 = parse + plan only, touch no hardware
 VERBOSE=0
 
 LOG_FILE="./wifi-traffic-gen.log"  # syslog-format event log; "" or --no-log disables
-# Run length (pick one; default = run each unused pool MAC once):
+# Run length (pick one; default = one pass over the file pool):
 RUN_MODE="pool"        # pool | repeats | duration | continuous
 REPEATS=0              # repeats mode: number of cycles to run
 DURATION=0             # duration mode: seconds of wall-clock to keep running
-AUTO_MAC=-1            # -1 = decide by mode; 0/1 = explicit. Generate fresh
-                       # random MACs once the file pool is spent (loop modes).
+# Loop modes (repeats/duration/continuous) wrap around the file pool: static
+# MACs recur (same returning client), 'random' slots re-mint a fresh MAC each
+# pass. MAC reuse is allowed and NOT checked against the used-MAC log.
 
 WPA_CONF=""            # temp per-cycle wpa_supplicant conf
 WPA_PID=""
@@ -94,18 +96,19 @@ Usage: sudo $0 [options]
   --max-secs N      alias of --session-max
   --downloads N     successful downloads/cycle    (default: $MIN_DOWNLOADS)
   --order seq|random  SSID pick order             (default: $NET_ORDER)
-  --hostname-prefix P  DHCP hostname prefix        (default: $HOSTNAME_PREFIX)
-                       each client sends "P-<mac suffix>" as DHCP option 12;
-                       the host's own /etc/hostname is NEVER changed.
+  --hostname-prefix P  prefix for TRANSIENT clients (default: $HOSTNAME_PREFIX)
+  --static-prefix P    prefix for STATIC users      (default: $STATIC_PREFIX)
+                       Hostname = "<prefix>-<hash of MAC>", sent as DHCP
+                       option 12. It's a deterministic hash, so a given MAC
+                       always maps to the same hostname. The host's own
+                       /etc/hostname is NEVER changed.
   --dl-timeout N    per-download ceiling seconds  (default: $DL_MAX_TIME)
 
-  Run length (choose one; default runs each unused pool MAC once):
+  Run length (choose one; default = one pass over the file pool):
   --repeats N       run exactly N cycles then stop
   --duration T      run cycles until T elapses (e.g. 90s, 30m, 2h, or plain secs)
   --continuous      run until interrupted (Ctrl-C)
   --cycles N        hard cap on total cycles in any mode (0 = no cap)
-  --no-auto-mac     in loop modes, stop when the file MAC pool is spent
-                    instead of generating fresh random MACs
 
   --dry-run         parse and plan only; no radio changes
   -v, --verbose
@@ -114,14 +117,18 @@ Usage: sudo $0 [options]
 Notes:
   * Session time is randomised per cycle between --session-min and
     --session-max, e.g. --session-min 60 --session-max 300.
-  * repeats/duration/continuous keep going past the file MAC pool by
-    generating fresh locally-administered random MACs (never reused),
-    unless --no-auto-mac is given.
+  * STATIC users are the explicit MACs in the MAC file: they recur (same
+    returning client) and get the --static-prefix. TRANSIENT clients come
+    from 'random' lines (and are re-minted fresh each pass) with the
+    --hostname-prefix. MAC reuse is allowed and not deduplicated.
+  * Loop modes wrap around the file pool; a continuous run therefore keeps
+    the static users reconnecting while minting fresh transient clients.
 
 File formats:
   networks.conf : one "SSID<TAB>PSK" per line (or 'SSID|PSK'). # comments ok.
-  macs.txt      : one MAC per line (AA:BB:CC:DD:EE:FF). Blank 'random' line
-                  tokens are expanded to a locally-administered random MAC.
+  macs.txt      : one MAC per line (AA:BB:CC:DD:EE:FF) = a static/returning
+                  user. The token 'random' = a transient client slot, minted
+                  fresh (locally-administered) each pass. # comments ok.
   urls.txt      : one URL per line. http(s) recommended.
 EOF
 }
@@ -143,9 +150,9 @@ while [[ $# -gt 0 ]]; do
         --repeats) RUN_MODE="repeats"; REPEATS="$2"; shift 2;;
         --duration) RUN_MODE="duration"; DURATION="$2"; shift 2;;
         --continuous) RUN_MODE="continuous"; shift;;
-        --no-auto-mac) AUTO_MAC=0; shift;;
         --order) NET_ORDER="$2"; shift 2;;
         --hostname-prefix) HOSTNAME_PREFIX="$2"; shift 2;;
+        --static-prefix) STATIC_PREFIX="$2"; shift 2;;
         --dl-timeout) DL_MAX_TIME="$2"; shift 2;;
         --dry-run) DRY_RUN=1; shift;;
         -v|--verbose) VERBOSE=1; shift;;
@@ -184,24 +191,20 @@ gen_random_mac() {
 
 normalise_mac() { tr 'A-F' 'a-f' <<<"${1// /}"; }
 
-# Build a DHCP hostname from the prefix + last 3 octets of the MAC.
-# Sanitised to RFC-952/1123 label rules (lowercase a-z 0-9 '-', <=63 chars).
+# Build a DHCP hostname: "<prefix>-<hash>" where hash is the first 6 hex of
+# sha1(MAC). Deterministic — a given MAC always yields the same hostname, so a
+# returning client keeps one identity across sessions/runs. Sanitised to
+# RFC-952/1123 label rules (lowercase a-z 0-9 '-', <=63 chars).
 gen_hostname() {
-    local mac="$1" nocolon suffix p
-    nocolon="${mac//:/}"
-    suffix="${nocolon: -6}"                 # last 6 hex chars (3 octets)
-    p="${HOSTNAME_PREFIX,,}"                 # lowercase
-    p="${p//[^a-z0-9-]/-}"                   # invalid chars -> hyphen
-    p="${p#-}"; p="${p%-}"                   # trim leading/trailing hyphens
+    local mac="$1" prefix="$2" p h
+    h="$(printf '%s' "${mac,,}" | sha1sum 2>/dev/null | cut -c1-6)"
+    [[ -z "$h" ]] && h="${mac//:/}"; h="${h: -6}"   # fallback if sha1sum absent
+    p="${prefix,,}"                          # lowercase
+    p="${p//[^a-z0-9-]/-}"                    # invalid chars -> hyphen
+    p="${p#-}"; p="${p%-}"                    # trim leading/trailing hyphens
     [[ -z "$p" ]] && p="wtg"
-    (( ${#p} > 50 )) && p="${p:0:50}"        # keep total <= 63
-    echo "${p}-${suffix}"
-}
-
-mac_already_used() {   # returns 0 if MAC present in USED_LOG
-    local mac; mac="$(normalise_mac "$1")"
-    [[ -f "$USED_LOG" ]] || return 1
-    cut -d, -f2 "$USED_LOG" 2>/dev/null | grep -qiFx "$mac"
+    (( ${#p} > 50 )) && p="${p:0:50}"         # keep total <= 63
+    echo "${p}-${h}"
 }
 
 record_mac() {         # record_mac MAC SSID HOSTNAME RESULT
@@ -227,32 +230,32 @@ require_tools() {
 }
 
 # ---------------- input loading ----------------
-declare -a SSIDS PSKS URLS MAC_POOL
-declare -A SEEN_MAC    # MACs issued this run (guards against in-run collisions)
-POOL_IDX=0            # cursor into MAC_POOL
+# Pool is a list of "slots". A static slot carries a fixed MAC (returning user);
+# a random slot mints a fresh transient MAC each time it is drawn.
+declare -a SSIDS PSKS URLS SLOT_MAC SLOT_KIND
+POOL_IDX=0           # cursor into the slot list
 
-# Set NEXT_MAC to the next never-used MAC and return 0, or return non-zero when
-# none remain. MUST be called directly (not in $()), so its updates to POOL_IDX
-# and SEEN_MAC persist in the current shell. Draws from the file pool first,
-# then (loop modes) generates fresh random MACs.
+# Set NEXT_MAC / NEXT_KIND to the next client and return 0, or non-zero when the
+# pool is spent (pool mode only). MUST be called directly (not in $()), so its
+# update to POOL_IDX persists in the current shell. Loop modes wrap the pool:
+# static slots recur (same MAC), random slots re-mint fresh each pass.
 NEXT_MAC=""
+NEXT_KIND=""
 next_mac() {
-    local m
-    while (( POOL_IDX < ${#MAC_POOL[@]} )); do
-        m="${MAC_POOL[$POOL_IDX]}"; ((POOL_IDX++))
-        [[ -n "${SEEN_MAC[$m]:-}" ]] && continue
-        SEEN_MAC[$m]=1; NEXT_MAC="$m"; return 0
-    done
-    if (( AUTO_MAC == 1 )); then
-        local tries=0
-        while (( tries < 2000 )); do
-            m="$(gen_random_mac)"; ((tries++))
-            [[ -n "${SEEN_MAC[$m]:-}" ]] && continue
-            mac_already_used "$m" && continue
-            SEEN_MAC[$m]=1; NEXT_MAC="$m"; return 0
-        done
+    local n=${#SLOT_MAC[@]}
+    (( n == 0 )) && return 1
+    if (( POOL_IDX >= n )); then
+        [[ "$RUN_MODE" == "pool" ]] && return 1   # one pass only
+        POOL_IDX=0                                 # wrap for loop modes
     fi
-    return 1
+    NEXT_KIND="${SLOT_KIND[$POOL_IDX]}"
+    if [[ "$NEXT_KIND" == "static" ]]; then
+        NEXT_MAC="${SLOT_MAC[$POOL_IDX]}"          # same MAC every pass
+    else
+        NEXT_MAC="$(gen_random_mac)"               # fresh transient each draw
+    fi
+    ((POOL_IDX++))
+    return 0
 }
 
 load_networks() {
@@ -290,22 +293,21 @@ load_urls() {
 
 load_macs() {
     [[ -f "$MACS_FILE" ]] || die "MAC file not found: $MACS_FILE"
-    local line mac
+    local line mac nstatic=0 nrandom=0
     while IFS= read -r line || [[ -n "$line" ]]; do
         line="${line%%$'\r'}"; line="${line// }"
         [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
         if [[ "$line" == "random" ]]; then
-            mac="$(gen_random_mac)"
+            SLOT_MAC+=(""); SLOT_KIND+=("random"); ((nrandom++))
         else
             mac="$(normalise_mac "$line")"
             [[ "$mac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || {
                 warn "Skipping invalid MAC: $line"; continue; }
+            SLOT_MAC+=("$mac"); SLOT_KIND+=("static"); ((nstatic++))
         fi
-        mac_already_used "$mac" && { dbg "Skipping already-used MAC $mac"; continue; }
-        MAC_POOL+=("$mac")
     done < "$MACS_FILE"
-    (( ${#MAC_POOL[@]} )) || die "No unused MACs available in $MACS_FILE"
-    info "MAC pool: ${#MAC_POOL[@]} unused address(es)."
+    (( ${#SLOT_MAC[@]} )) || die "No usable entries in $MACS_FILE"
+    info "MAC pool: $nstatic static user(s), $nrandom transient slot(s)."
 }
 
 # ---------------- radio control ----------------
@@ -400,11 +402,12 @@ do_downloads() {
 
 # ---------------- one cycle ----------------
 run_cycle() {
-    local mac="$1" ssid="$2" psk="$3"
-    local budget dls result="fail" hn
+    local mac="$1" ssid="$2" psk="$3" kind="${4:-static}"
+    local budget dls result="fail" hn prefix
     budget="$(rand_between "$MIN_SECS" "$MAX_SECS")"
-    hn="$(gen_hostname "$mac")"
-    info "Cycle: mac=$mac host=$hn ssid=\"$ssid\" budget=${budget}s downloads=$MIN_DOWNLOADS"
+    [[ "$kind" == "static" ]] && prefix="$STATIC_PREFIX" || prefix="$HOSTNAME_PREFIX"
+    hn="$(gen_hostname "$mac" "$prefix")"
+    info "Cycle: kind=$kind mac=$mac host=$hn ssid=\"$ssid\" budget=${budget}s downloads=$MIN_DOWNLOADS"
 
     if (( DRY_RUN )); then
         info "  [dry-run] would set MAC, associate, DHCP (hostname=$hn), download, disconnect"
@@ -452,12 +455,9 @@ main() {
     (( MIN_SECS <= MAX_SECS )) || die "--session-min must be <= --session-max"
     [[ "$NET_ORDER" == seq || "$NET_ORDER" == random ]] || die "--order must be seq or random"
 
-    # Resolve duration string -> seconds, and AUTO_MAC default by mode.
+    # Resolve duration string -> seconds.
     if [[ "$RUN_MODE" == "duration" ]]; then
         DURATION="$(parse_duration "$DURATION")"
-    fi
-    if (( AUTO_MAC == -1 )); then
-        [[ "$RUN_MODE" == "pool" ]] && AUTO_MAC=0 || AUTO_MAC=1
     fi
 
     mkdir -p "$STATE_DIR"
@@ -468,14 +468,14 @@ main() {
     load_macs
 
     case "$RUN_MODE" in
-        pool)       info "Run mode: pool (${#MAC_POOL[@]} unused MAC(s), one pass)";;
-        repeats)    info "Run mode: repeats ($REPEATS cycle(s), auto-mac=$AUTO_MAC)";;
-        duration)   info "Run mode: duration (${DURATION}s, auto-mac=$AUTO_MAC)";;
-        continuous) info "Run mode: continuous until interrupted (auto-mac=$AUTO_MAC)";;
+        pool)       info "Run mode: pool (one pass over ${#SLOT_MAC[@]} slot(s))";;
+        repeats)    info "Run mode: repeats ($REPEATS cycle(s), pool wraps)";;
+        duration)   info "Run mode: duration (${DURATION}s, pool wraps)";;
+        continuous) info "Run mode: continuous until interrupted (pool wraps)";;
     esac
     info "Settings: iface=$IFACE order=$NET_ORDER session=${MIN_SECS}-${MAX_SECS}s downloads=$MIN_DOWNLOADS cap=$CYCLES dry_run=$DRY_RUN"
 
-    local i=0 ok=0 n=0 idx mac start
+    local i=0 ok=0 n=0 idx mac kind start
     start="$(date +%s)"
     while :; do
         # ---- termination checks ----
@@ -487,8 +487,8 @@ main() {
         esac
         (( CYCLES > 0 && i >= CYCLES )) && break
 
-        next_mac || { info "MAC supply exhausted after $n cycle(s)."; break; }
-        mac="$NEXT_MAC"
+        next_mac || { info "Pool pass complete after $n cycle(s)."; break; }
+        mac="$NEXT_MAC"; kind="$NEXT_KIND"
 
         if [[ "$NET_ORDER" == "random" ]]; then
             idx=$(( RANDOM % ${#SSIDS[@]} ))
@@ -496,7 +496,7 @@ main() {
             idx=$(( i % ${#SSIDS[@]} ))
         fi
         ((n++))
-        run_cycle "$mac" "${SSIDS[$idx]}" "${PSKS[$idx]}" && ((ok++))
+        run_cycle "$mac" "${SSIDS[$idx]}" "${PSKS[$idx]}" "$kind" && ((ok++))
         ((i++))
     done
 

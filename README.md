@@ -10,15 +10,29 @@ lab/demo infrastructure you own or administer.
 
 ## What it does, per cycle
 
-1. Takes the next **unused** MAC from the pool and sets it on the interface.
+1. Takes the next MAC from the pool and sets it on the interface.
 2. Associates to a configured SSID using the PSK you supply.
-3. Gets a DHCP lease.
+3. Gets a DHCP lease, sending a per-client hostname (DHCP option 12).
 4. Performs N successful randomised downloads from a URL list.
 5. Holds the connection for a randomised duration (within limits), then
    releases the lease and tears down.
 
-Every MAC used is appended to `used_macs.csv` and **never reused** — across
-runs, not just within one.
+Every cycle is appended to `used_macs.csv`
+(`timestamp,mac,ssid,hostname,result`).
+
+## Static vs transient clients
+
+The MAC file mixes two kinds of client:
+
+- **Static / returning users** — explicit MACs in the file. They recur every
+  pass (loop modes wrap the pool), so the NMS sees the same client connect and
+  disconnect over time. They get the `--static-prefix` hostname (default `su-`).
+- **Transient clients** — each `random` line is a slot that mints a fresh
+  locally-administered MAC every time it's drawn. They get the
+  `--hostname-prefix` (default `wtg-`).
+
+MAC reuse is allowed and **not** deduplicated — returning users recurring is the
+point, and repeated clients look more natural to the NMS.
 
 ## Requirements
 
@@ -48,7 +62,8 @@ Key flags (`--help` for the full list):
 | `--session-min` / `--session-max` | random connected-time window (s) | `30` / `120` |
 | `--downloads N` | successful downloads per cycle | `3` |
 | `--order seq\|random` | SSID pick order | `seq` |
-| `--hostname-prefix P` | DHCP hostname prefix for test clients | `wtg` |
+| `--hostname-prefix P` | hostname prefix for transient clients | `wtg` |
+| `--static-prefix P` | hostname prefix for static users | `su` |
 | `-L FILE` / `--log FILE` | syslog-format event log | `wifi-traffic-gen.log` |
 | `--no-log` | disable the event log | — |
 | `--dry-run` | parse + plan only | off |
@@ -66,19 +81,19 @@ Pick one; the default runs each unused pool MAC once:
 | `--duration T` | run until T elapses — `90s`, `30m`, `2h`, or plain seconds |
 | `--continuous` | run until interrupted (Ctrl-C) |
 | `--cycles N` | hard cap on total cycles in any mode (`0` = no cap) |
-| `--no-auto-mac` | in loop modes, stop when the file pool is spent instead of generating MACs |
 
-Because a MAC is never reused, `--repeats` / `--duration` / `--continuous`
-generate fresh locally-administered random MACs once the file pool is spent (so
-a continuous run keeps producing distinct clients). `--no-auto-mac` disables
-that and stops at the end of the file pool.
+`--repeats` / `--duration` / `--continuous` **wrap around the file pool**: each
+pass replays the static users (same MACs, same hostnames) and re-mints the
+transient slots with fresh MACs. So a continuous run keeps the returning users
+reconnecting while a stream of new one-off clients comes and goes. Add or remove
+`random` lines to change the ratio of transient to static traffic.
 
 ### Logging
 
 Two records are written:
 
 - **`used_macs.csv`** — one row per cycle: `timestamp,mac,ssid,hostname,result`.
-  The authoritative record of which MACs have been used (drives no-reuse).
+  A full ledger of every client session (maps hostname ↔ MAC ↔ SSID).
 - **`wifi-traffic-gen.log`** — syslog-format (RFC3164) event log of
   associations, leases, downloads, errors and disconnects. `INFO` for normal
   actions, `WARNING`/`ERR` for problems, `DEBUG` with `-v`. Point it elsewhere
@@ -87,17 +102,19 @@ Two records are written:
 ### Hostnames
 
 Each client sends a hostname as **DHCP option 12** so test clients are easy to
-spot in the NMS. The hostname is `<prefix>-<last 3 octets of MAC>`, e.g.
-`wtg-334401`. Set the prefix with `--hostname-prefix` (it's sanitised to valid
-hostname characters). The host's own `/etc/hostname` is **never** changed — the
-name is injected into each DHCP request only, so the impact on the machine is
-nil. The chosen hostname is recorded per cycle in `used_macs.csv`.
+spot in the NMS. The hostname is `<prefix>-<hash>`, where `<hash>` is the first
+6 hex of `sha1(MAC)`. Because the hash is deterministic, a given MAC **always**
+maps to the same hostname — so a returning static user keeps one identity across
+sessions and runs. Static users use `--static-prefix` (default `su`), transient
+clients use `--hostname-prefix` (default `wtg`), e.g. `su-c98a83`, `wtg-1f0b7a`.
+The host's own `/etc/hostname` is **never** changed — the name is injected into
+each DHCP request only, so the impact on the machine is nil.
 
 ## Input files
 
 - **networks.conf** — `SSID<TAB>PSK` or `SSID|PSK` per line. `#` comments ok.
-- **macs.txt** — one MAC per line; the token `random` expands to a
-  locally-administered (`02:…`) address. Already-used MACs are skipped.
+- **macs.txt** — one MAC per line = a static/returning user; the token `random`
+  = a transient slot minted fresh each pass. `#` comments ok.
 - **urls.txt** — one URL per line. Point at your own test server for a closed
   demo, or at public speed-test files.
 
